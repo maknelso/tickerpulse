@@ -1,0 +1,33 @@
+# pyproject.toml is single source of truth for project
+
+# defines what project is and what needs to run
+[project]
+name = "stock-alert-system"
+version = "0.1.0"
+description = "A high-scale stock monitoring system using Kafka and FastStream"
+# replaces requirements.txt
+dependencies = [
+    "pydantic>=2.0.0",
+    "faststream[kafka]",
+    "structlog",
+    "python-dotenv",
+    "finnhub-python", # https://finnhub.io/docs/api
+    "httpx"
+]
+
+# test engine 
+[tool.pytest.ini_options]
+# This solves your 'ModuleNotFoundError' permanently
+# Tells `pytest` to treat current folder (root) as place to loo kfor code
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"  # This tells pytest to handle async functions automatically
+
+# factory instructions
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]  # This tells it to include all packages it finds

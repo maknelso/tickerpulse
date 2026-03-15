@@ -1,15 +1,17 @@
-from pydantic import BaseModel, Field
-from datetime import datetime
-
 """
 Contract-Driven Development and Schema Validation using Pydantic. 
 This shows you're thinking about "System Robustness," not just "making it work."
-
-
-
 """
-class StockTick(BaseModel):
-    # Field validation: symbol must be a string, price must be positive
-    symbol: str
-    price: float = Field(gt=0, description="The trade price must be greater than zero")
-    timestamp: datetime
+
+from pydantic import BaseModel, Field
+from datetime import datetime
+
+# Field is when you want more control over a field
+
+# now StockTicker is a data model with validation
+class StockTicker(BaseModel):
+    ticker: str = Field(..., description="The stock symbol, e.g. AAPL")
+    price: float = Field(gt=0.0, description="The current price, must be positive")
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
