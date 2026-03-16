@@ -1,109 +1,145 @@
-"""
-Asynchronous Event Producer (Kafka vVersion)
+import os
+import asyncio 
+import structlog
+import logging
+import httpx 
+from typing import Set, List
+from datetime import datetime
 
-Pattern:
-- Fetch data from source (Massive) 
-- Publish it to a bus (message bus) (Kafka) so other services can react to it 
-
-Every 12s, it calls market API (massive client) to get latest price for a stock (e.g. QLD)
-It packages the price into a small box (JSON msg) and hands it to delivery driver.
-
-Kafka - middleman, it makes sure box gets stored in specific Topic, in our case `stock_ticks`
-it holds onto the msg so even if Worker is busy or crashes, the messages are not lost.
-"""
-
-import os # interact with os - read environment var, file paths, etc.
-import asyncio # built in module for async programming - run multiple tasks concurrently without blocking
-from dotenv import load_dotenv # dotenv is a lib that reads a .env file and loads var into environment
-
-# modern tools
-# SDK/client lib so we odn't have to manually construct HTTP requests
-#   instantiate client with credentials, call method to interact with service
-from massive import RESTClient
-# FastStream is a framework for building msg-driven apps. Instead of HTTP requests, services communicate by publishing and consuming
-#   messages through message broker like Kafka
+from dotenv import load_dotenv
 from faststream import FastStream
 from faststream.kafka import KafkaBroker
 
-from common.models import StockTick
+from common.models import StockTicker
 
-# Load secrets
-load_dotenv() # actually reads the .env file and loads var into environment so os.getenv() can access
-API_KEY = os.getenv("MASSIVE_API_KEY")
-# Inside Docker, we'll use the service name 'kafka' defined in docker-compose
-KAFKA_URL = os.getenv("KAFKA_URL", "localhost:9092")
+# Load env variables once
+load_dotenv()
 
-"""
-Kafka is actually quite difficult to install and run manually. 
-Docker allows us to download a "pre-packaged" version of Kafka that is guaranteed to work exactly the same way on your computer as it does on a server 
-in the cloud.
+# --- Configuration & Environment ---
+API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
-When you run docker-compose up, you are telling your computer:
+# Use a default ("AAPL") only if the .env variable is missing
+raw_tickers = os.getenv("TICKERS", "AAPL")
+TICKER_LIST = [t.strip() for t in raw_tickers.split(",") if t.strip()]
 
-"Run a Kafka server."
-"Run my Producer code in its own little bubble."
-"Run my Worker code in its own little bubble."
-"Connect them all to a private virtual network."
-"""
+KAFKA_URL = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
-# Initialize the Kafka Broker
+# 1. structlog - copied and pasted
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        structlog.dev.set_exc_info,
+        structlog.processors.TimeStamper(fmt="iso"),
+        # This line turns everything into clean JSON for Datadog/ELK
+        structlog.processors.JSONRenderer() 
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+logger = structlog.get_logger()
+
+# --- Global Entities ---
 broker = KafkaBroker(KAFKA_URL)
-
-# Create the FastStream App (the orchestrator)
 app = FastStream(broker)
+background_tasks: Set[asyncio.Task] = set()
 
-# Initialize the Massive Client
-client = RESTClient(API_KEY)
+# Initialize the client globally for shared connection pooling
+# We'll open/close it in the app lifecycle hooks
+http_client: httpx.AsyncClient = None
 
-async def stream_ticker(ticker: str):
-    """Fetches price from Massive and pushes it to Kafka."""
-    print(f"Starting Kafka stream for {ticker} ...")
+# --- Business Logic ---
+async def stream_ticker(ticker: str) -> None:
+    """Fetches stock data using contextual logging."""
+    
+    # BIND the ticker to this logger instance. 
+    # Now EVERY log inside this function automatically includes "ticker": "QLD"
+    log = logger.bind(ticker=ticker)
+    log.info("stream_started")
+
+    # Exponential Backoff variables
+    base_delay = 1
+    max_delay = 60 
+    factor = 2
+    current_delay = base_delay
 
     while True:
         try:
-            print("Fetching data...")
+            url = "https://finnhub.io/api/v1/quote"
+            params = {"symbol": ticker, "token": API_KEY}
+            
+            # Use the GLOBAL http_client here to benefit from pooling
+            response = await http_client.get(url, params=params)
+            
+            if response.status_code != 200:
+                log.error("api_request_failed", status=response.status_code)
+                raise Exception(f"API Error: {response.status_code}")
 
-            # Get latest price
-            trade = client.get_last_trade(ticker)
+            res = response.json()
+            current_price = res.get('c')
 
-            # Create the validated object
-            payload = StockTick(
-                symbol=ticker,
-                price=trade.price,
-                timestamp=trade.timestamp
+            if current_price is None or current_price == 0:
+                log.warning("invalid_price_ignored", data=res)
+                await asyncio.sleep(5)
+                continue
+
+            log.info("quote_received", 
+                    price=current_price,
+                    high=res.get('h'), 
+                    low=res.get('l')
+            )
+            
+            payload = StockTicker(
+                ticker=ticker,
+                price=current_price,
+                timestamp=int(datetime.now().timestamp() * 1000)
             )
 
-            # Publish it to Kafka topic
-            # FastStream automatically converts the Pydantic object to JSON for Kafka
-            await broker.publish(payload, topic="stock_ticks")
+            await broker.publish(payload, topic="ticker_prices")
+            log.info("tick_published", price=current_price)
 
-            print(f"Kafka Broadcast: {ticker} @ ${trade.price}")
-
-            # Wait 12 seconds (respects Massive's free tier 5 calls per min)
+            current_delay = base_delay
             await asyncio.sleep(12)
 
+        except asyncio.CancelledError:
+            log.info("task_cancelled_shutting_down")
+            raise # This re-raises the CancelledError after our log
         except Exception as e:
-            print(f"Validation or API Error: {e}")
-            await asyncio.sleep(5) # wait a bit before retrying
+            log.error("stream_error", error=str(e))
+            await asyncio.sleep(current_delay)
+            current_delay = min(current_delay * factor, max_delay)
 
-# Create a set to keep a strong reference to your tasks
-background_tasks = set()
-
+# --- Lifecycle Hooks ---
 @app.after_startup
-async def start_tasks():
-    # create the task
-    # we use create_task so it runs in the background
-    task = asyncio.create_task(stream_ticker("QLD"))
+async def startup_logic() -> None:
+    global http_client
+    # Open the connection pool once
+    http_client = httpx.AsyncClient(timeout=10.0)
+    
+    for ticker in TICKER_LIST:
+        task = asyncio.create_task(stream_ticker(ticker))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        logger.info("task_initialized", ticker=ticker)
 
-    # add it to the set so it isn't GCed
-    background_tasks.add(task)
-
-    # tell task to remove itself from set once it's done 
-    # in our case, it runs forever
-    task.add_done_callback(background_tasks.discard)
+@app.after_shutdown
+async def shutdown_logic() -> None:
+    logger.info("shutdown_started", active_tasks=len(background_tasks))
+    
+    for task in background_tasks:
+        task.cancel()
+    
+    # Gracefully close the shared connection pool
+    if http_client:
+        await http_client.aclose()
+        
+    logger.info("shutdown_complete")
 
 if __name__ == "__main__":
-    # this fires up the whole engine
-    asyncio.run(app.run())
-
-
+    try:
+        asyncio.run(app.run())
+    except KeyboardInterrupt:
+        logger.info("process_interrupted")
